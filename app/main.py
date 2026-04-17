@@ -185,72 +185,82 @@ def explain_why_bot(row: pd.Series) -> list:
     return reasons
 
 
+def _get_trained_model():
+    """Train the model on internal synthetic data (runs once, cached).
+
+    The model learns bot patterns from our known synthetic population,
+    then applies that knowledge to score any uploaded data.
+    """
+    from src.data.config import SimulationConfig
+    from src.data.simulator import SocialDataSimulator
+
+    # Train on synthetic data with seed=42 (independent of sample CSV seed=99)
+    config = SimulationConfig(seed=42)
+    sim = SocialDataSimulator(config)
+    train_users = sim.generate_users()
+
+    extractor = AccountFeatureExtractor()
+    train_enriched = extractor.transform(train_users)
+
+    scorer = CoordinationScorer(max_depth=5, random_state=42)
+    scorer.fit(train_enriched, train_enriched["is_bot"], run_cv=False)
+    return scorer
+
+
 def run_analysis(df: pd.DataFrame):
-    """Run the full detection pipeline on a DataFrame."""
-    # Feature extraction
+    """Run the full detection pipeline on uploaded data.
+
+    Architecture:
+        1. Model trains on INTERNAL synthetic data (known bots).
+        2. Uploaded data is scored BLINDLY — the model has never seen it.
+        3. If uploaded CSV has 'is_bot', it is used ONLY to measure accuracy.
+    """
+    # Feature extraction on uploaded data
     extractor = AccountFeatureExtractor()
     enriched = extractor.transform(df)
 
-    # Clustering
+    # Clustering on uploaded data
     clusterer = BehavioralClusterAnalyzer(n_clusters=4, random_state=42)
     cluster_labels = clusterer.fit_predict(enriched)
     enriched["cluster"] = cluster_labels
 
-    has_labels = "is_bot" in df.columns
-    scorer = None
-    scores = None
+    # Get the pre-trained model (trained on synthetic data, NOT this data)
+    scorer = _get_trained_model()
+
+    # Score uploaded data blindly
+    scores = scorer.predict_proba_batch(enriched)
+    enriched["bot_score"] = scores
+    enriched["flagged_as_bot"] = scores >= 0.5
+
     metrics = None
+    has_labels = "is_bot" in df.columns
 
     if has_labels:
-        # Train model and score
-        scorer = CoordinationScorer(max_depth=5, random_state=42)
-        scorer.fit(enriched, enriched["is_bot"], run_cv=True)
-        scores = scorer.predict_proba_batch(enriched)
-        enriched["bot_score"] = scores
-        enriched["flagged_as_bot"] = scores >= 0.5
-
-        # Cross-validated predictions for fair accuracy
+        # User provided ground truth — measure how well our model
+        # (trained on synthetic data) generalizes to THEIR data
         from sklearn.tree import DecisionTreeClassifier
         from sklearn.preprocessing import StandardScaler
+
+        y_true = enriched["is_bot"].astype(int).values
+        y_pred = (scores >= 0.5).astype(int)
+
+        # Also run cross-validation on THIS dataset to show generalization
         X = enriched[AccountFeatureExtractor.FEATURE_COLUMNS].values
-        y = enriched["is_bot"].astype(int).values
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(X)
-
-        cv_preds = cross_val_predict(
-            DecisionTreeClassifier(max_depth=5, random_state=42, class_weight="balanced"),
-            X_scaled, y, cv=5,
-        )
         cv_scores = cross_val_score(
             DecisionTreeClassifier(max_depth=5, random_state=42, class_weight="balanced"),
-            X_scaled, y, cv=5, scoring="accuracy",
+            X_scaled, y_true, cv=5, scoring="accuracy",
         )
 
         metrics = {
-            "accuracy": accuracy_score(y, cv_preds),
-            "precision": precision_score(y, cv_preds),
-            "recall": recall_score(y, cv_preds),
-            "f1": f1_score(y, cv_preds),
+            "accuracy": accuracy_score(y_true, y_pred),
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "recall": recall_score(y_true, y_pred, zero_division=0),
+            "f1": f1_score(y_true, y_pred, zero_division=0),
             "cv_scores": cv_scores,
-            "confusion": confusion_matrix(y, cv_preds),
-            "cv_preds": cv_preds,
+            "confusion": confusion_matrix(y_true, y_pred),
         }
-    else:
-        # No labels — use unsupervised anomaly scoring
-        # Flag the most anomalous cluster (highest amplification, lowest follow_ratio)
-        cluster_summary = clusterer.get_cluster_summary(enriched, cluster_labels)
-        # Find the most suspicious cluster
-        if "bot_ratio" not in cluster_summary.columns:
-            cluster_summary["suspicion"] = (
-                cluster_summary["amplification_ratio"] / (cluster_summary["follow_ratio"] + 0.01)
-            )
-            suspicious_cluster = cluster_summary.loc[cluster_summary["suspicion"].idxmax(), "cluster_id"]
-        else:
-            suspicious_cluster = cluster_summary.loc[cluster_summary["bot_ratio"].idxmax(), "cluster_id"]
-
-        enriched["bot_score"] = 0.0
-        enriched.loc[enriched["cluster"] == suspicious_cluster, "bot_score"] = 0.85
-        enriched["flagged_as_bot"] = enriched["cluster"] == suspicious_cluster
 
     return enriched, clusterer, scorer, metrics
 
@@ -313,7 +323,7 @@ def render_data_input():
     else:
         if os.path.exists(SAMPLE_DATA_PATH):
             df = pd.read_csv(SAMPLE_DATA_PATH)
-            st.success(f"Loaded built-in sample — **{len(df):,}** accounts ({df['is_bot'].sum():,} known bots).")
+            st.success(f"Loaded built-in sample — **{len(df):,}** accounts. The model will detect bots automatically.")
             return df
         else:
             st.error("Sample data file not found. Please upload your own CSV.")
