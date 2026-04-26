@@ -77,7 +77,7 @@ class InferencePipeline:
         Orchestrates:
             1. Entity lookup in the users DataFrame.
             2. Account-level feature extraction.
-            3. Coordination scoring via the Decision Tree model.
+            3. Coordination scoring via the SVM model.
             4. Flag generation with human-readable explanations.
             5. Optional cluster assignment lookup.
 

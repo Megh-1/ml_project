@@ -1,47 +1,48 @@
 """
 Coordination Scorer
 =====================
-Supervised scoring engine using a probabilistically calibrated Decision Tree.
-Provides per-user coordination likelihood scores with explainable feature
+Supervised bot scoring engine using a probabilistic Support Vector Machine.
+Provides per-user coordination likelihood scores plus lightweight feature
 attribution for each prediction.
 
 Design Decisions:
-    - DecisionTreeClassifier with max_depth=5 for interpretability.
-    - predict_proba for calibrated probability outputs (0.0–1.0).
-    - Per-prediction feature importance via tree path analysis.
-    - Global feature importances exposed for model auditing.
+    - Linear SVM by default so feature weights remain auditable.
+    - StandardScaler normalization before model fitting.
+    - class_weight="balanced" for imbalanced bot-vs-legit populations.
+    - predict_proba via SVC probability calibration for dashboard scores.
 
-No NLP — purely structural/behavioral signal scoring.
+No NLP - purely structural/behavioral signal scoring.
 """
 
 import logging
-from typing import Dict, List, Optional, Any, Union
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 
 logger = logging.getLogger(__name__)
 
 
 class CoordinationScorer:
-    """Decision Tree-based coordination likelihood scorer.
+    """SVM-based coordination likelihood scorer.
 
-    Wraps a scikit-learn DecisionTreeClassifier to produce calibrated
-    probability scores and explainable feature attributions for each
-    prediction.
+    Wraps a scikit-learn SVC to produce probability scores and interpretable
+    feature attributions for bot/coordination prediction.
 
     Args:
-        max_depth: Maximum depth of the decision tree. Defaults to 5 for
-            interpretability while maintaining discrimination.
+        C: SVM regularization strength. Lower values regularize more.
+        kernel: SVM kernel. Defaults to "linear" for explainability.
+        gamma: Kernel coefficient for non-linear kernels.
         random_state: Random seed for reproducibility.
-        feature_columns: Feature columns used for scoring. Defaults to the
-            standard account-level features.
+        feature_columns: Feature columns used for scoring.
+        max_depth: Deprecated compatibility argument from the old tree model.
 
     Example:
-        >>> scorer = CoordinationScorer()
+        >>> scorer = CoordinationScorer(C=1.0, kernel="linear")
         >>> scorer.fit(enriched_users_df, enriched_users_df["is_bot"])
         >>> result = scorer.predict_coordination_score(user_row_df)
         >>> print(result["coordination_likelihood"])
@@ -55,30 +56,37 @@ class CoordinationScorer:
 
     def __init__(
         self,
-        max_depth: int = 5,
+        C: float = 1.0,
+        kernel: str = "linear",
+        gamma: Union[str, float] = "scale",
         random_state: int = 42,
         feature_columns: Optional[List[str]] = None,
+        max_depth: Optional[int] = None,
     ) -> None:
-        if max_depth < 1:
-            raise ValueError(f"max_depth must be >= 1, got {max_depth}")
+        if C <= 0:
+            raise ValueError(f"C must be > 0, got {C}")
+        if max_depth is not None:
+            logger.warning(
+                "CoordinationScorer no longer uses max_depth; ignoring legacy value %s",
+                max_depth,
+            )
 
-        self._max_depth = max_depth
+        self._C = C
+        self._kernel = kernel
+        self._gamma = gamma
         self._random_state = random_state
         self._feature_columns = feature_columns or self._DEFAULT_FEATURES
 
-        self._classifier = DecisionTreeClassifier(
-            max_depth=max_depth,
-            random_state=random_state,
-            class_weight="balanced",  # Handle class imbalance (500 bots vs 9500 legit)
-        )
+        self._classifier = self._build_classifier(probability=True)
         self._scaler = StandardScaler()
         self._is_fitted = False
         self._training_accuracy: Optional[float] = None
         self._cv_scores: Optional[np.ndarray] = None
 
         logger.info(
-            "CoordinationScorer initialized | max_depth=%d | features=%s",
-            max_depth,
+            "CoordinationScorer initialized | svm_kernel=%s | C=%.4f | features=%s",
+            kernel,
+            C,
             self._feature_columns,
         )
 
@@ -92,80 +100,82 @@ class CoordinationScorer:
         labels: pd.Series,
         run_cv: bool = True,
     ) -> "CoordinationScorer":
-        """Train the coordination scoring model.
+        """Train the SVM scoring model.
 
         Args:
             features_df: DataFrame containing feature columns.
-            labels: Binary labels (True = bot/coordinated, False = legit).
-            run_cv: If True, run 5-fold cross-validation and log accuracy.
+            labels: Binary labels (True/1 = bot/coordinated, False/0 = legit).
+            run_cv: If True, run stratified cross-validation and log accuracy.
 
         Returns:
             self (for method chaining).
 
         Raises:
-            ValueError: If features_df is missing required columns.
+            ValueError: If features or labels are invalid.
         """
         self._validate_features(features_df)
+        y = self._prepare_labels(labels, expected_length=len(features_df))
 
-        X = features_df[self._feature_columns].values
-        y = labels.astype(int).values
-
-        # Scale features
+        X = features_df[self._feature_columns].to_numpy(dtype=float)
         X_scaled = self._scaler.fit_transform(X)
 
-        # Fit classifier
         self._classifier.fit(X_scaled, y)
         self._is_fitted = True
-
-        # Training accuracy
         self._training_accuracy = float(self._classifier.score(X_scaled, y))
 
-        # Cross-validation
         if run_cv:
-            self._cv_scores = cross_val_score(
-                DecisionTreeClassifier(
-                    max_depth=self._max_depth,
+            n_splits = self._compute_cv_splits(y)
+            if n_splits >= 2:
+                cv = StratifiedKFold(
+                    n_splits=n_splits,
+                    shuffle=True,
                     random_state=self._random_state,
-                    class_weight="balanced",
-                ),
-                X_scaled,
-                y,
-                cv=5,
-                scoring="accuracy",
-            )
-            logger.info(
-                "Model trained | train_acc=%.4f | cv_acc=%.4f ± %.4f",
-                self._training_accuracy,
-                self._cv_scores.mean(),
-                self._cv_scores.std(),
-            )
+                )
+                self._cv_scores = cross_val_score(
+                    make_pipeline(
+                        StandardScaler(),
+                        self._build_classifier(probability=False),
+                    ),
+                    X,
+                    y,
+                    cv=cv,
+                    scoring="accuracy",
+                )
+                logger.info(
+                    "SVM trained | train_acc=%.4f | cv_acc=%.4f +/- %.4f | folds=%d",
+                    self._training_accuracy,
+                    self._cv_scores.mean(),
+                    self._cv_scores.std(),
+                    n_splits,
+                )
+            else:
+                self._cv_scores = None
+                logger.warning(
+                    "SVM trained | train_acc=%.4f | cross-validation skipped "
+                    "because one class has fewer than 2 examples",
+                    self._training_accuracy,
+                )
         else:
-            logger.info(
-                "Model trained | train_acc=%.4f",
-                self._training_accuracy,
-            )
+            self._cv_scores = None
+            logger.info("SVM trained | train_acc=%.4f", self._training_accuracy)
 
         return self
 
     def predict_coordination_score(
         self,
         user_features: Union[pd.DataFrame, pd.Series, np.ndarray],
-    ) -> Dict[str, Any]:
-        """Score a single user or batch of users for coordination likelihood.
+    ) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
+        """Score one or more users for coordination likelihood.
 
         Args:
             user_features: Feature data for one or more users. Can be:
                 - pd.DataFrame with feature columns
-                - pd.Series (single user)
+                - pd.Series for one user
                 - np.ndarray of shape (n_features,) or (n_users, n_features)
 
         Returns:
-            Dict containing:
-                - coordination_likelihood (float): Probability of being
-                  coordinated/bot (0.0–1.0).
-                - top_features (list): Top 2 most important features with
-                  names and their values for this prediction.
-                - risk_tier (str): CRITICAL/HIGH/MEDIUM/LOW based on score.
+            A dict for one user, or a list of dicts for a batch. Each dict
+            contains coordination_likelihood, top_features, and risk_tier.
 
         Raises:
             RuntimeError: If model has not been fitted.
@@ -175,83 +185,107 @@ class CoordinationScorer:
 
         X = self._prepare_input(user_features)
         X_scaled = self._scaler.transform(X)
+        probabilities = self._classifier.predict_proba(X_scaled)
+        positive_idx = self._positive_class_index()
+        bot_probabilities = probabilities[:, positive_idx]
 
-        # Probability of positive class (bot/coordinated)
-        proba = self._classifier.predict_proba(X_scaled)
-
-        # Handle single vs batch — return single dict for single user
         if X.shape[0] == 1:
-            likelihood = float(proba[0, 1])
-            top_features = self._get_top_features(X[0])
+            likelihood = float(bot_probabilities[0])
             return {
                 "coordination_likelihood": likelihood,
-                "top_features": top_features,
+                "top_features": self._get_top_features(X[0]),
                 "risk_tier": self._compute_risk_tier(likelihood),
             }
 
-        # Batch mode: return list of dicts
         results = []
         for i in range(X.shape[0]):
-            likelihood = float(proba[i, 1])
-            top_features = self._get_top_features(X[i])
-            results.append({
-                "coordination_likelihood": likelihood,
-                "top_features": top_features,
-                "risk_tier": self._compute_risk_tier(likelihood),
-            })
+            likelihood = float(bot_probabilities[i])
+            results.append(
+                {
+                    "coordination_likelihood": likelihood,
+                    "top_features": self._get_top_features(X[i]),
+                    "risk_tier": self._compute_risk_tier(likelihood),
+                }
+            )
         return results
 
     def predict_proba_batch(self, features_df: pd.DataFrame) -> np.ndarray:
-        """Return coordination probabilities for all users in a DataFrame.
-
-        Convenience method for bulk scoring (e.g., for the dashboard).
+        """Return bot probabilities for all users in a DataFrame.
 
         Args:
             features_df: DataFrame with feature columns.
 
         Returns:
-            np.ndarray of shape (n_users,) with coordination probabilities.
+            np.ndarray of shape (n_users,) with bot probabilities.
 
         Raises:
             RuntimeError: If model has not been fitted.
+            ValueError: If feature columns are missing.
         """
         self._check_fitted()
         self._validate_features(features_df)
 
-        X = features_df[self._feature_columns].values
+        X = features_df[self._feature_columns].to_numpy(dtype=float)
         X_scaled = self._scaler.transform(X)
-        return self._classifier.predict_proba(X_scaled)[:, 1]
+        probabilities = self._classifier.predict_proba(X_scaled)
+        return probabilities[:, self._positive_class_index()]
 
     def get_global_feature_importances(self) -> Dict[str, float]:
-        """Return global feature importances from the trained Decision Tree.
+        """Return normalized feature weights from the trained SVM.
 
-        Returns:
-            Dict mapping feature names to their Gini importance scores.
+        For the default linear kernel this uses absolute SVM coefficients.
+        Non-linear kernels do not expose direct feature weights, so equal
+        weights are returned as a conservative fallback.
 
         Raises:
             RuntimeError: If model has not been fitted.
         """
         self._check_fitted()
-        importances = self._classifier.feature_importances_
+        importances = self._get_global_importance_vector()
         return {
-            name: float(imp)
-            for name, imp in zip(self._feature_columns, importances)
+            name: float(importance)
+            for name, importance in zip(self._feature_columns, importances)
         }
 
     @property
     def training_accuracy(self) -> Optional[float]:
-        """Training set accuracy (after fitting)."""
+        """Training set accuracy after fitting."""
         return self._training_accuracy
 
     @property
     def cv_scores(self) -> Optional[np.ndarray]:
-        """Cross-validation accuracy scores (after fitting with run_cv=True)."""
+        """Cross-validation accuracy scores after fitting with run_cv=True."""
         return self._cv_scores
 
     @property
     def feature_columns(self) -> List[str]:
         """Feature column names used by the model."""
         return self._feature_columns.copy()
+
+    @property
+    def svm_params(self) -> Dict[str, Any]:
+        """SVM configuration used by this scorer."""
+        return {
+            "C": self._C,
+            "kernel": self._kernel,
+            "gamma": self._gamma,
+            "class_weight": "balanced",
+        }
+
+    # ------------------------------------------------------------------
+    # Private: Classifier Construction
+    # ------------------------------------------------------------------
+
+    def _build_classifier(self, probability: bool) -> SVC:
+        """Create an SVC instance with the scorer's current configuration."""
+        return SVC(
+            C=self._C,
+            kernel=self._kernel,
+            gamma=self._gamma,
+            probability=probability,
+            class_weight="balanced",
+            random_state=self._random_state,
+        )
 
     # ------------------------------------------------------------------
     # Private: Feature Attribution
@@ -262,29 +296,52 @@ class CoordinationScorer:
         feature_values: np.ndarray,
         top_k: int = 2,
     ) -> List[Dict[str, Any]]:
-        """Extract the top-k most important features for a single prediction.
+        """Extract the top-k local SVM feature contributions.
 
-        Uses global feature importances weighted by the user's actual feature
-        values to produce a per-prediction attribution.
-
-        Args:
-            feature_values: Feature vector for a single user.
-            top_k: Number of top features to return.
-
-        Returns:
-            List of dicts with 'feature_name', 'importance', 'value'.
+        For a linear SVM, local contribution is coefficient * scaled feature
+        value. This keeps explanations tied to the actual prediction. For
+        non-linear kernels, falls back to global importance weights.
         """
-        importances = self._classifier.feature_importances_
-        top_indices = np.argsort(importances)[::-1][:top_k]
+        contributions = self._get_local_contributions(feature_values)
+        magnitudes = np.abs(contributions)
+
+        if np.isclose(magnitudes.sum(), 0.0):
+            magnitudes = self._get_global_importance_vector()
+
+        normalized = magnitudes / magnitudes.sum()
+        top_indices = np.argsort(normalized)[::-1][:top_k]
 
         return [
             {
                 "feature_name": self._feature_columns[idx],
-                "importance": float(importances[idx]),
+                "importance": float(normalized[idx]),
                 "value": float(feature_values[idx]),
+                "direction": (
+                    "raises_bot_risk" if contributions[idx] >= 0 else "lowers_bot_risk"
+                ),
             }
             for idx in top_indices
         ]
+
+    def _get_local_contributions(self, feature_values: np.ndarray) -> np.ndarray:
+        """Return signed local contributions for linear SVM predictions."""
+        if self._kernel == "linear" and hasattr(self._classifier, "coef_"):
+            scaled = self._scaler.transform(feature_values.reshape(1, -1))[0]
+            coefficients = self._classifier.coef_.reshape(-1)
+            return coefficients * scaled
+
+        return self._get_global_importance_vector()
+
+    def _get_global_importance_vector(self) -> np.ndarray:
+        """Return normalized global feature importances."""
+        n_features = len(self._feature_columns)
+        if self._kernel == "linear" and hasattr(self._classifier, "coef_"):
+            importances = np.abs(self._classifier.coef_.reshape(-1))
+            total = importances.sum()
+            if total > 0:
+                return importances / total
+
+        return np.full(n_features, 1.0 / n_features)
 
     # ------------------------------------------------------------------
     # Private: Risk Tier Classification
@@ -292,28 +349,14 @@ class CoordinationScorer:
 
     @staticmethod
     def _compute_risk_tier(likelihood: float) -> str:
-        """Map coordination likelihood to a human-readable risk tier.
-
-        Thresholds:
-            - CRITICAL: >= 0.85 (high-confidence bot/coordinated)
-            - HIGH: >= 0.65
-            - MEDIUM: >= 0.40
-            - LOW: < 0.40
-
-        Args:
-            likelihood: Coordination probability (0.0–1.0).
-
-        Returns:
-            Risk tier string.
-        """
+        """Map coordination likelihood to a human-readable risk tier."""
         if likelihood >= 0.85:
             return "CRITICAL"
-        elif likelihood >= 0.65:
+        if likelihood >= 0.65:
             return "HIGH"
-        elif likelihood >= 0.40:
+        if likelihood >= 0.40:
             return "MEDIUM"
-        else:
-            return "LOW"
+        return "LOW"
 
     # ------------------------------------------------------------------
     # Private: Input Preparation & Validation
@@ -323,26 +366,19 @@ class CoordinationScorer:
         self,
         user_features: Union[pd.DataFrame, pd.Series, np.ndarray],
     ) -> np.ndarray:
-        """Normalize various input types to a 2D NumPy array.
-
-        Args:
-            user_features: Input in DataFrame, Series, or ndarray format.
-
-        Returns:
-            np.ndarray of shape (n_users, n_features).
-
-        Raises:
-            ValueError: If input shape is incompatible.
-        """
+        """Normalize supported input types to a 2D NumPy array."""
         if isinstance(user_features, pd.DataFrame):
             missing = set(self._feature_columns) - set(user_features.columns)
             if missing:
                 raise ValueError(f"Missing feature columns: {missing}")
-            X = user_features[self._feature_columns].values
+            X = user_features[self._feature_columns].to_numpy(dtype=float)
         elif isinstance(user_features, pd.Series):
-            X = user_features[self._feature_columns].values.reshape(1, -1)
+            missing = set(self._feature_columns) - set(user_features.index)
+            if missing:
+                raise ValueError(f"Missing feature columns: {missing}")
+            X = user_features[self._feature_columns].to_numpy(dtype=float).reshape(1, -1)
         elif isinstance(user_features, np.ndarray):
-            X = user_features
+            X = user_features.astype(float, copy=False)
         else:
             raise ValueError(f"Unsupported input type: {type(user_features)}")
 
@@ -351,32 +387,91 @@ class CoordinationScorer:
 
         if X.shape[1] != len(self._feature_columns):
             raise ValueError(
-                f"Expected {len(self._feature_columns)} features, "
-                f"got {X.shape[1]}"
+                f"Expected {len(self._feature_columns)} features, got {X.shape[1]}"
             )
+
+        if not np.isfinite(X).all():
+            raise ValueError("Input features contain NaN or infinite values")
+
         return X
 
     def _validate_features(self, features_df: pd.DataFrame) -> None:
-        """Validate that required feature columns are present.
-
-        Raises:
-            ValueError: If features_df is empty or missing required columns.
-        """
+        """Validate that required feature columns are present and numeric."""
         if features_df.empty:
             raise ValueError("features_df cannot be empty")
+
         missing = set(self._feature_columns) - set(features_df.columns)
         if missing:
             raise ValueError(
                 f"features_df missing required feature columns: {missing}. "
-                f"Run AccountFeatureExtractor.transform() first."
+                "Run AccountFeatureExtractor.transform() first."
             )
 
-    def _check_fitted(self) -> None:
-        """Ensure the model has been fitted before prediction.
+        values = features_df[self._feature_columns].to_numpy(dtype=float)
+        if not np.isfinite(values).all():
+            raise ValueError("features_df contains NaN or infinite feature values")
 
-        Raises:
-            RuntimeError: If fit() has not been called.
-        """
+    @staticmethod
+    def _prepare_labels(labels: pd.Series, expected_length: int) -> np.ndarray:
+        """Validate and normalize binary labels to 0/1 integers."""
+        if len(labels) != expected_length:
+            raise ValueError(
+                f"labels length ({len(labels)}) does not match "
+                f"features_df length ({expected_length})"
+            )
+
+        label_series = pd.Series(labels)
+        if (
+            pd.api.types.is_bool_dtype(label_series)
+            or pd.api.types.is_integer_dtype(label_series)
+            or pd.api.types.is_float_dtype(label_series)
+        ):
+            numeric = label_series.astype(float).to_numpy()
+            if not np.isfinite(numeric).all() or not np.isin(numeric, [0.0, 1.0]).all():
+                raise ValueError("labels must be binary values")
+            y = numeric.astype(int)
+        else:
+            mapping = {
+                "true": 1,
+                "1": 1,
+                "bot": 1,
+                "yes": 1,
+                "false": 0,
+                "0": 0,
+                "legit": 0,
+                "normal": 0,
+                "human": 0,
+                "no": 0,
+            }
+            normalized = label_series.astype(str).str.strip().str.lower().map(mapping)
+            if normalized.isna().any():
+                raise ValueError(
+                    "labels must be binary values such as True/False, 1/0, "
+                    "bot/legit, or yes/no"
+                )
+            y = normalized.astype(int).to_numpy()
+
+        unique = np.unique(y)
+        if len(unique) != 2 or set(unique) != {0, 1}:
+            raise ValueError(
+                "labels must contain both binary classes: 0/False for legit and "
+                "1/True for bot"
+            )
+        return y
+
+    @staticmethod
+    def _compute_cv_splits(y: np.ndarray, desired_splits: int = 5) -> int:
+        """Choose a safe stratified CV split count for the class balance."""
+        class_counts = np.bincount(y.astype(int), minlength=2)
+        return int(min(desired_splits, class_counts.min()))
+
+    def _positive_class_index(self) -> int:
+        """Return the predict_proba column index for the bot class."""
+        classes = list(self._classifier.classes_)
+        return classes.index(1)
+
+    def _check_fitted(self) -> None:
+        """Ensure the model has been fitted before prediction."""
         if not self._is_fitted:
             raise RuntimeError(
                 "CoordinationScorer has not been fitted. Call fit() first."

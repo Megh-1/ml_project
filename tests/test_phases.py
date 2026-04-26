@@ -241,9 +241,9 @@ def cluster_labels(enriched_users_df):
 
 @pytest.fixture(scope="module")
 def scorer(enriched_users_df):
-    """Trained CoordinationScorer."""
+    """Trained SVM CoordinationScorer."""
     from src.models.scoring import CoordinationScorer
-    scorer = CoordinationScorer(max_depth=5)
+    scorer = CoordinationScorer(C=1.0, kernel="linear")
     scorer.fit(enriched_users_df, enriched_users_df["is_bot"])
     return scorer
 
@@ -285,7 +285,7 @@ class TestBehavioralClusterAnalyzer:
 
 
 class TestCoordinationScorer:
-    """Tests for Decision Tree coordination scoring."""
+    """Tests for SVM coordination scoring."""
 
     def test_training_accuracy_high(self, scorer):
         assert scorer.training_accuracy is not None
@@ -327,6 +327,12 @@ class TestCoordinationScorer:
         for name in ["follow_ratio", "amplification_ratio", "posting_velocity"]:
             assert name in importances
             assert 0.0 <= importances[name] <= 1.0
+
+    def test_svm_params(self, scorer):
+        params = scorer.svm_params
+        assert params["kernel"] == "linear"
+        assert params["C"] == 1.0
+        assert params["class_weight"] == "balanced"
 
     def test_risk_tiers(self, scorer):
         from src.models.scoring import CoordinationScorer
@@ -429,6 +435,121 @@ class TestDashboard:
         assert len(interactions_df) > 0
 
 
+# ======================================================================
+# Phase 6: Real Data Adapter Tests
+# ======================================================================
+
+class TestRealDataAdapter:
+    """Tests for the RealDataAdapter that maps real Twitter CSVs to internal schema."""
+
+    def _make_real_schema_df(self, n: int = 20) -> pd.DataFrame:
+        """Create a small DataFrame mimicking the real Twitter CSV schema."""
+        rng = np.random.default_rng(42)
+        return pd.DataFrame({
+            "user_id": [f"u{i}" for i in range(n)],
+            "label": rng.choice([0, 1], size=n),
+            "split": "test",
+            "followers_count": rng.integers(0, 10_000, size=n),
+            "friends_count": rng.integers(0, 5_000, size=n),
+            "statuses_count": rng.integers(1, 500, size=n),
+            "n_retweets": rng.integers(0, 200, size=n).astype(float),
+            "account_age_days": rng.integers(1, 3000, size=n),
+        })
+
+    def test_is_real_schema_detection(self):
+        from src.data.adapter import RealDataAdapter
+        real_df = self._make_real_schema_df()
+        assert RealDataAdapter.is_real_schema(real_df) is True
+
+        # Internal schema should NOT be detected as real
+        internal_df = pd.DataFrame({"followers": [1], "following": [2]})
+        assert RealDataAdapter.is_real_schema(internal_df) is False
+
+    def test_column_renaming(self):
+        from src.data.adapter import RealDataAdapter
+        real_df = self._make_real_schema_df()
+        adapted = RealDataAdapter.adapt(real_df)
+
+        assert "followers" in adapted.columns
+        assert "following" in adapted.columns
+        assert "total_posts" in adapted.columns
+        assert "total_retweets" in adapted.columns
+        assert "is_bot" in adapted.columns
+        assert "user_id" in adapted.columns
+        assert "account_age_days" in adapted.columns
+
+        # Original real column names should be renamed
+        assert "followers_count" not in adapted.columns
+        assert "friends_count" not in adapted.columns
+
+    def test_nan_handling(self):
+        from src.data.adapter import RealDataAdapter
+        real_df = self._make_real_schema_df()
+        # Inject NaN values
+        real_df.loc[0, "n_retweets"] = np.nan
+        real_df.loc[1, "statuses_count"] = np.nan
+
+        adapted = RealDataAdapter.adapt(real_df)
+        assert adapted["total_retweets"].isna().sum() == 0
+        assert adapted["total_posts"].isna().sum() == 0
+
+    def test_passthrough_for_internal_schema(self):
+        from src.data.adapter import RealDataAdapter
+        internal_df = pd.DataFrame({
+            "user_id": ["a"], "followers": [10], "following": [20],
+            "total_posts": [5], "total_retweets": [3], "account_age_days": [100],
+        })
+        result = RealDataAdapter.adapt(internal_df)
+        pd.testing.assert_frame_equal(result, internal_df)
+
+    def test_end_to_end_with_feature_extractor(self):
+        from src.data.adapter import RealDataAdapter
+        real_df = self._make_real_schema_df(50)
+        adapted = RealDataAdapter.adapt(real_df)
+
+        extractor = AccountFeatureExtractor()
+        enriched = extractor.transform(adapted)
+
+        for col in AccountFeatureExtractor.FEATURE_COLUMNS:
+            assert col in enriched.columns
+        assert len(enriched) == 50
+
+    def test_end_to_end_with_scorer(self):
+        from src.data.adapter import RealDataAdapter
+        from src.models.scoring import CoordinationScorer
+
+        # Create adapted data with both classes
+        real_df = self._make_real_schema_df(100)
+        # Ensure both classes exist
+        real_df.loc[:49, "label"] = 0
+        real_df.loc[50:, "label"] = 1
+        adapted = RealDataAdapter.adapt(real_df)
+
+        extractor = AccountFeatureExtractor()
+        enriched = extractor.transform(adapted)
+
+        scorer = CoordinationScorer(C=1.0, kernel="linear")
+        scorer.fit(enriched, enriched["is_bot"], run_cv=False)
+        scores = scorer.predict_proba_batch(enriched)
+        assert len(scores) == 100
+        assert all(0.0 <= s <= 1.0 for s in scores)
+
+    def test_list_available_tables(self):
+        from src.data.adapter import RealDataAdapter
+        available = RealDataAdapter.list_available_tables()
+        # At minimum test_table.csv should exist
+        assert "test" in available
+
+    def test_load_table(self):
+        from src.data.adapter import RealDataAdapter
+        # Load a small portion to verify it works (full load is large but should work)
+        df = RealDataAdapter.load_table("test")
+        assert "followers" in df.columns
+        assert "following" in df.columns
+        assert "total_posts" in df.columns
+        assert "is_bot" in df.columns
+        assert len(df) > 0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-
