@@ -1,0 +1,24 @@
+# Datasets
+*.csv
+*.json
+dataset2/
+skew_fixed/
+drive-download-*/
+master_table.csv
+test_table.csv
+train_table.csv
+val_table.csv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Visuals
+visuals/
+*.png
+
+# DS_Store
+.DS_Store
